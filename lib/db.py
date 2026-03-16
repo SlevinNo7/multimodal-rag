@@ -79,6 +79,30 @@ def get_all_documents(authed_client: Client | None = None) -> list[dict]:
     return result.data
 
 
+def get_documents_page(
+    authed_client: Client | None = None,
+    page: int = 0,
+    page_size: int = 20,
+) -> tuple[list[dict], int]:
+    """Returns (rows, total_count) for the given page (0-indexed)."""
+    client = authed_client or get_client()
+    from_idx = page * page_size
+    to_idx = from_idx + page_size - 1
+    result = (
+        client
+        .table("documents")
+        .select(
+            "id, title, content_type, original_filename, chunk_index, chunk_total, created_at",
+            count="exact",
+        )
+        .order("created_at", desc=True)
+        .range(from_idx, to_idx)
+        .execute()
+    )
+    total = result.count or 0
+    return result.data, total
+
+
 def delete_document(doc_id: str, authed_client: Client | None = None) -> None:
     client = authed_client or get_client()
     client.table("documents").delete().eq("id", doc_id).execute()
