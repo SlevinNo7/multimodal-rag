@@ -24,6 +24,7 @@ def _build_user_message(query: str, context_chunks: list[dict]) -> str:
 @runtime_checkable
 class LLMProvider(Protocol):
     def reason(self, query: str, context_chunks: list[dict]) -> str: ...
+    def stream(self, query: str, context_chunks: list[dict]): ...
 
 
 class OpenAIProvider:
@@ -42,6 +43,20 @@ class OpenAIProvider:
         )
         return response.choices[0].message.content
 
+    def stream(self, query: str, context_chunks: list[dict]):
+        response = self._client.chat.completions.create(
+            model=self.model,
+            stream=True,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": _build_user_message(query, context_chunks)},
+            ],
+        )
+        for chunk in response:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+
 
 class AnthropicProvider:
     def __init__(self, api_key: str, model: str = "claude-sonnet-4-5"):
@@ -58,6 +73,15 @@ class AnthropicProvider:
         )
         return response.content[0].text
 
+    def stream(self, query: str, context_chunks: list[dict]):
+        with self._client.messages.stream(
+            model=self.model,
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": _build_user_message(query, context_chunks)}],
+        ) as s:
+            yield from s.text_stream
+
 
 class GeminiProvider:
     def __init__(self, api_key: str, model: str = "gemini-2.0-flash-lite"):
@@ -73,6 +97,16 @@ class GeminiProvider:
             config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
         )
         return response.text
+
+    def stream(self, query: str, context_chunks: list[dict]):
+        from google.genai import types
+        for chunk in self._client.models.generate_content_stream(
+            model=self.model,
+            contents=_build_user_message(query, context_chunks),
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+        ):
+            if chunk.text:
+                yield chunk.text
 
 
 class OllamaProvider:
@@ -93,6 +127,26 @@ class OllamaProvider:
         response = httpx.post(f"{self.base_url}/api/chat", json=payload, timeout=120)
         response.raise_for_status()
         return response.json()["message"]["content"]
+
+    def stream(self, query: str, context_chunks: list[dict]):
+        import httpx
+        import json
+        payload = {
+            "model": self.model,
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": _build_user_message(query, context_chunks)},
+            ],
+        }
+        with httpx.stream("POST", f"{self.base_url}/api/chat", json=payload, timeout=120) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if line:
+                    data = json.loads(line)
+                    content = data.get("message", {}).get("content", "")
+                    if content:
+                        yield content
 
 
 def get_provider(settings: dict) -> LLMProvider:

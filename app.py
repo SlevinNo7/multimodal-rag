@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from lib import db, rag, auth
+from lib import db, rag, auth, llm
 
 st.set_page_config(page_title="Multimodal RAG", page_icon="🔍", layout="wide")
 
@@ -173,35 +173,34 @@ with tab_upload:
         if st.button("Embed & Store", type="primary"):
             total_stored = 0
             for file_idx, uploaded in enumerate(uploaded_files):
-                st.write(f"**Processing {file_idx+1}/{len(uploaded_files)}: {uploaded.name}**")
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                chunks_done = [0]
+                with st.status(
+                    f"**{uploaded.name}** ({file_idx + 1}/{len(uploaded_files)})",
+                    expanded=True,
+                ) as file_status:
+                    def on_progress(msg: str, _s=file_status):
+                        _s.write(msg)
 
-                def on_progress(msg: str, _bar=progress_bar, _st=status_text, _c=chunks_done):
-                    _c[0] += 1
-                    _st.text(msg)
-                    _bar.progress(min(_c[0] * 10, 100))
-
-                try:
-                    file_bytes = uploaded.read()
-                    mime = uploaded.type or "application/octet-stream"
-                    status_text.text("Processing...")
-                    results = rag.ingest(
-                        file_bytes=file_bytes,
-                        filename=uploaded.name,
-                        title=title,
-                        mime_type=mime,
-                        on_progress=on_progress,
-                        authed_client=authed_client,
-                        user_id=user_id,
-                    )
-                    progress_bar.progress(100)
-                    status_text.text("Done!")
-                    total_stored += len(results)
-                except Exception as e:
-                    st.error(f"Error processing {uploaded.name}: {e}")
-                    raise
+                    try:
+                        results = rag.ingest(
+                            file_bytes=uploaded.read(),
+                            filename=uploaded.name,
+                            title=title,
+                            mime_type=uploaded.type or "application/octet-stream",
+                            on_progress=on_progress,
+                            authed_client=authed_client,
+                            user_id=user_id,
+                        )
+                        total_stored += len(results)
+                        file_status.update(
+                            label=f"✅ {uploaded.name} — {len(results)} Chunk(s)",
+                            state="complete",
+                            expanded=False,
+                        )
+                    except Exception as e:
+                        file_status.update(
+                            label=f"❌ {uploaded.name} — Fehler: {e}",
+                            state="error",
+                        )
             st.success(f"Stored {total_stored} chunk(s) across {len(uploaded_files)} file(s)")
             st.cache_data.clear()
     elif uploaded_files and not title:
@@ -223,17 +222,23 @@ with tab_search:
                         top_k=top_k,
                         threshold=threshold,
                         filter_type=filter_type,
-                        use_codex=use_codex,
+                        use_codex=False,
                         authed_client=authed_client,
-                        llm_settings=st.session_state["llm_settings"] if use_codex else None,
+                        llm_settings=None,
                     )
                 except Exception as e:
                     st.error(f"Search error: {e}")
                     raise
 
-            if result["answer"]:
+            if use_codex and result["sources"]:
                 st.subheader("Answer")
-                st.markdown(result["answer"])
+                try:
+                    provider = llm.get_provider(st.session_state["llm_settings"])
+                    st.write_stream(provider.stream(query_text.strip(), result["sources"]))
+                except Exception as e:
+                    st.error(f"LLM error: {e}")
+            elif use_codex and not result["sources"]:
+                st.info("No matching documents found — LLM reasoning skipped.")
 
             st.subheader(f"Sources ({len(result['sources'])} matches)")
             if not result["sources"]:
@@ -254,7 +259,7 @@ with tab_search:
                         mime = (src.get("metadata") or {}).get("mime_type", "video/mp4")
                         st.video(vid_bytes, format=mime)
                     elif src.get("text_content"):
-                        st.text(src["text_content"][:2000])
+                        st.code(src["text_content"][:2000], language=None, wrap_lines=True)
                     else:
                         st.caption(f"Non-text content ({src['content_type']})")
                     if src.get("metadata"):
@@ -264,15 +269,28 @@ with tab_search:
 with tab_browse:
     st.subheader("All documents")
 
+    _PAGE_SIZE = 20
+    if "browse_page" not in st.session_state:
+        st.session_state["browse_page"] = 0
+
     try:
-        docs = db.get_all_documents(authed_client=authed_client)
+        docs, total_docs = db.get_documents_page(
+            authed_client=authed_client,
+            page=st.session_state["browse_page"],
+            page_size=_PAGE_SIZE,
+        )
     except Exception as e:
         st.error(f"Error loading documents: {e}")
-        docs = []
+        docs, total_docs = [], 0
 
-    if not docs:
+    if not docs and total_docs == 0:
         st.info("No documents yet. Upload something in the first tab.")
     else:
+        total_pages = max(1, (total_docs + _PAGE_SIZE - 1) // _PAGE_SIZE)
+        st.caption(
+            f"{total_docs} Dokumente gesamt — Seite "
+            f"{st.session_state['browse_page'] + 1}/{total_pages}"
+        )
         st.dataframe(
             docs,
             use_container_width=True,
@@ -287,17 +305,47 @@ with tab_browse:
             },
         )
 
+        pg_col1, pg_col2, pg_col3 = st.columns([1, 2, 1])
+        with pg_col1:
+            if st.button("← Zurück", disabled=st.session_state["browse_page"] == 0):
+                st.session_state["browse_page"] -= 1
+                st.rerun()
+        with pg_col3:
+            if st.button(
+                "Weiter →",
+                disabled=st.session_state["browse_page"] >= total_pages - 1,
+            ):
+                st.session_state["browse_page"] += 1
+                st.rerun()
+
         st.divider()
         st.subheader("Delete documents")
+
+        if "pending_delete_id" not in st.session_state:
+            st.session_state["pending_delete_id"] = None
+
         delete_id = st.text_input("Document ID to delete")
         if st.button("Delete", type="secondary"):
             if delete_id.strip():
-                try:
-                    db.delete_document(delete_id.strip(), authed_client=authed_client)
-                    st.success(f"Deleted {delete_id}")
-                    st.cache_data.clear()
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Delete error: {e}")
+                st.session_state["pending_delete_id"] = delete_id.strip()
             else:
                 st.warning("Enter a document ID.")
+
+        if st.session_state["pending_delete_id"]:
+            pending = st.session_state["pending_delete_id"]
+            st.warning(f"Wirklich löschen: `{pending}`?")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Ja, löschen", type="primary"):
+                    try:
+                        db.delete_document(pending, authed_client=authed_client)
+                        st.success(f"Gelöscht: {pending}")
+                        st.session_state["pending_delete_id"] = None
+                        st.cache_data.clear()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Delete error: {e}")
+            with col2:
+                if st.button("Abbrechen"):
+                    st.session_state["pending_delete_id"] = None
+                    st.rerun()
