@@ -9,14 +9,11 @@ A SaaS-ready Retrieval-Augmented Generation application that embeds multiple con
    pip install -r requirements.txt
    ```
 
-2. Create a `.env` file with your API keys:
+2. Create a `.env` file from the template:
+   ```bash
+   cp .env.example .env
    ```
-   GEMINI_API_KEY=your-key
-   OPENAI_API_KEY=your-key          # optional, for OpenAI provider
-   SUPABASE_URL=https://your-project.supabase.co
-   SUPABASE_SERVICE_KEY=your-service-role-key
-   SUPABASE_ANON_KEY=your-anon-key  # required for user auth
-   ```
+   Then fill in your API keys (see `.env.example` for all available options).
 
 3. Add `DATABASE_URL` to your `.env` file (needed once for the setup script):
 
@@ -38,6 +35,28 @@ A SaaS-ready Retrieval-Augmented Generation application that embeds multiple con
    ```bash
    streamlit run app.py
    ```
+
+## Docker
+
+The easiest way to run the app without installing anything locally.
+
+```bash
+# Copy and fill in your environment variables
+cp .env.example .env
+
+# Build and start
+docker compose up --build
+
+# Run in background
+docker compose up --build -d
+
+# Stop
+docker compose down
+```
+
+The app is then available at **http://localhost:8501**.
+
+> The `.env` file is mounted at runtime and never baked into the image.
 
 ## Features
 
